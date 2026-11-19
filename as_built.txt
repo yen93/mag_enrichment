@@ -1,0 +1,90 @@
+================================================================================
+AS-BUILT — MAG Enrichment
+Last updated: 2026-11-19 (initial: contact-enrichment service split out of Alternate
+Lead Finder)
+================================================================================
+
+OVERVIEW
+A shared contact-enrichment service. Any lead-type automation turns a person's name +
+company into an EMAIL (and a PHONE when it is returned free in the same lookup) via
+Hunter.io (main) -> Lusha V3 (backup). One table (contact_enrichment) is both a QUEUE and
+a CACHE, so the same person+company is paid for only once. Lives in the same Supabase
+project as the business tables; alternate_leads is the first caller, not a special case.
+
+SUPABASE PROJECT
+- aivitcomiywiysrfwqxt (MAGTestProject, ap-northeast-1) — holds the contact_enrichment
+  table, the contact-enrichment edge function, its pg_cron job, AND the business/lead
+  tables the service writes back to. One project.
+
+EDGE FUNCTION
+- supabase/functions/contact-enrichment/index.ts — Deno + @supabase/supabase-js (service
+  role), verify_jwt=false. Version 1 (2026-11-19). URL:
+  https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/contact-enrichment
+  Interfaces:
+  1. PARAM CALL (on-demand): POST .../contact-enrichment/lookup (or ?lookup=1) with headers
+     Authorization: Bearer <anon> and x-enrich-secret: <ENRICH_SHARED_SECRET>; body
+     {firstName,lastName,companyName,companyDomain?,sourceTable?,sourceId?,writeBack?} ->
+     {status,email,phone,provider,cached}. Cache-checked first (no credits on a repeat).
+  2. CRON DRAIN (batch): enqueues approved alternate_leads, then processes up to
+     ENRICH_MAX_PER_RUN pending rows (cache -> Hunter -> Lusha), writing results back.
+  3. PUSH: any automation INSERTs a pending contact_enrichment row; the next drain takes it.
+  Providers: Hunter GET /v2/email-finder (X-API-KEY header; email + score + phone_number in
+  one response, phone free) -> Lusha POST /v3/contacts/search-and-enrich (api_key header;
+  reveal:["emails"] only, phone billed separately so skipped).
+  Outcomes: found -> status 'done' + writeback (email/phone + processed flag); both
+  providers empty -> 'not_found' + writeback processed (one-shot; reset to 'pending' to
+  retry); provider error/quota -> stays 'pending', retries; no name -> 'error' (not
+  retried). Systemic Hunter 401/403/429 or Lusha 401/402/403 disables that provider for the
+  run. Wall-clock guard stops the drain near the ~150s isolate kill.
+  Debug params: ?dry=1 (preview, ZERO provider calls/writes), ?sync=1 (await + summary),
+  ?enqueueonly=1 (enqueue, no providers), ?limit=N (lower the cap).
+  WRITEBACK registry (in index.ts) maps source_table -> {id,email,phone?,processed?}.
+  Registered: alternate_leads -> {id, email, phone_number, is_processed}. Unregistered
+  sources still get their result stored in contact_enrichment; only write-back is skipped.
+  Requires (Supabase function secrets): HUNTER_IO_API_KEY, LUSHA_API_KEY,
+  ENRICH_SHARED_SECRET (+ auto-injected SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY). Optional:
+  ENRICH_MAX_PER_RUN (10), ENRICH_MONTHLY_CAP (50), HUNTER_MIN_SCORE (0),
+  ENRICH_CACHE_MAX_AGE_DAYS (0 = never expire), WALL_CLOCK_MS (150000),
+  WALL_CLOCK_RESERVE_MS (8000), PROVIDER_TIMEOUT_MS (20000).
+
+EXTERNAL INTEGRATIONS
+- Hunter.io (api.hunter.io/v2/email-finder, X-API-KEY header) — MAIN provider. FREE plan
+  ~50 searches/month (shared across all callers). Key returned 401 on 2026-11-15 — verify
+  before the first live run. Key in Supabase secret HUNTER_IO_API_KEY; local
+  hunter_io_api_key.txt (gitignored); mirror in GCP Secret Manager (hunter-io-api-key).
+- Lusha (api.lusha.com/v3, api_key header) — BACKUP provider (email only). V3 only (V2
+  sunset 2026-11-30); free plan 44 credits. Key in Supabase secret LUSHA_API_KEY; local
+  lusha_api_key.txt (gitignored).
+
+DATA STORES (project aivitcomiywiysrfwqxt)
+- contact_enrichment — queue + cache + audit log. Columns: inputs (poc_firstname,
+  poc_lastname, company_name, company_domain), provenance (source_table, source_id,
+  source_type, context jsonb), dedup_key (generated: name + domain|company), outputs
+  (email, email_score, phone, provider in hunter|lusha|cache), lifecycle (status in
+  pending|done|not_found|error, attempts, last_error, resolved_at). Unique index on
+  (source_table, source_id); indexes on dedup_key, status, resolved_at. RLS on, no policies
+  (service role bypasses). DDL: supabase/migrations/20261119_create_contact_enrichment.sql.
+- alternate_leads (in the same project, owned by the Alternate Lead Finder) — the first
+  caller. The function reads approved rows (status='Send intro', no email, unprocessed) and
+  writes back email / phone_number / is_processed. Domain resolved via thread_id ->
+  closed_sequence_threads.email.
+
+AUTOMATIONS / ROUTINES (pg_cron; UTC-only)
+- contact-enrichment-weekday (project aivitcomiywiysrfwqxt, jobid 46) — '0 6 * * 1-5' =
+  2:00 PM PHT Mon-Fri. net.http_post to the function with the anon key; returns 202 and
+  does nothing until leads are approved / rows are pending.
+
+OPEN ITEMS / KNOWN RISKS
+- Hunter key health (401 on 2026-11-15) — confirm valid before the first batch.
+- Not yet exercised with live provider creds (deliberate: held for the first live run).
+- Shared Hunter free quota (~50/mo) across all future callers — watch ENRICH_MONTHLY_CAP.
+- Other pg_cron jobs in this Supabase project embed live keys in their command text — don't
+  print cron.job rows into chat/exports.
+
+LOCAL FILES (all gitignored)
+- supabase_access_token.txt — Supabase Management API token (deploys + secrets).
+- hunter_io_api_key.txt, lusha_api_key.txt — provider keys (mirror of Supabase secrets).
+- enrich_shared_secret.txt — the x-enrich-secret value for the param call.
+- manual_invoke.txt — ready-to-paste curl/SQL examples.
+- prompts/191126_enrichment.txt — the original brief.
+================================================================================

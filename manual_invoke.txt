@@ -1,0 +1,52 @@
+MANUAL INVOKE — contact-enrichment
+(anon key below is the PUBLIC anon JWT; the x-enrich-secret is in enrich_shared_secret.txt)
+
+Base URL:
+  https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/contact-enrichment
+
+Anon bearer (gateway) — public anon key:
+  eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFpdml0Y29taXl3aXlzcmZ3cXh0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUzODQ3OTYsImV4cCI6MjA5MDk2MDc5Nn0.4fpVwIpuYZwtEWKQA2X8pG2Ok-ryocZNA7k3ScDLbUE
+
+-------------------------------------------------------------------------------
+1) DRY PREVIEW (safe — no provider calls, no writes)
+-------------------------------------------------------------------------------
+curl -s "https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/contact-enrichment?dry=1" ^
+  -H "Authorization: Bearer <ANON>"
+
+-------------------------------------------------------------------------------
+2) PARAM CALL — enrich one contact on demand (SPENDS credits unless cached)
+   x-enrich-secret value is in enrich_shared_secret.txt
+-------------------------------------------------------------------------------
+curl -s -X POST "https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/contact-enrichment/lookup" ^
+  -H "Authorization: Bearer <ANON>" ^
+  -H "x-enrich-secret: <ENRICH_SHARED_SECRET>" ^
+  -H "Content-Type: application/json" ^
+  -d "{\"firstName\":\"Jane\",\"lastName\":\"Doe\",\"companyName\":\"Acme\",\"companyDomain\":\"acme.com\",\"sourceTable\":\"my_leads\",\"sourceId\":123}"
+# -> {"status":"done","email":"...","phone":null,"provider":"hunter","cached":false}
+# writeBack defaults to true; pass "writeBack":false to only return + cache (no row update).
+
+-------------------------------------------------------------------------------
+3) RUN THE DRAIN NOW (await + summary; SPENDS credits)
+-------------------------------------------------------------------------------
+curl -s "https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/contact-enrichment?sync=1" ^
+  -H "Authorization: Bearer <ANON>"
+
+-------------------------------------------------------------------------------
+4) ENQUEUE ONLY (no provider calls, no credits)
+-------------------------------------------------------------------------------
+curl -s "https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/contact-enrichment?enqueueonly=1" ^
+  -H "Authorization: Bearer <ANON>"
+
+-------------------------------------------------------------------------------
+5) PUSH a pending row from SQL (any lead type) — the next drain picks it up
+-------------------------------------------------------------------------------
+insert into public.contact_enrichment
+  (poc_firstname, poc_lastname, company_name, company_domain, source_table, source_id, source_type, status)
+values
+  ('Jane','Doe','Acme','acme.com','my_leads',123,'my_lead','pending')
+on conflict (source_table, source_id) do nothing;
+
+-------------------------------------------------------------------------------
+6) RETRY a row that came back not_found / errored
+-------------------------------------------------------------------------------
+update public.contact_enrichment set status='pending' where id = <row_id>;
